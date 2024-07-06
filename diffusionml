@@ -1,0 +1,483 @@
+This is a simple guidance to ML combo research. The guidance introduce different part along the combo research process:
+Data Loading
+Feature/Label Pre-processing
+ML Model Training
+Live Trading Requirements
+Resource Usage
+Performance Evaluation
+Here's a sample python code for ML combo structure, including data loading, data pre-processing and feature/label preparing, ML model training and predicting, checkpoint supporting, etc. Researchers could adjust/change the structure according to different scenarios.
+
+ 展开源码
+1. Data Loading
+1.1 Three ways of data loading
+There're different ways to load data from standard data cache or custom dumped data paths.
+
+1.1.1 Using memmap to load data
+All cached data can be loaded via numpy memmap package, but we should be careful to specify correct data type. For example, cap.N,6656f means the cap data is with dtype='float32' and instrument size 6656 for each day; WindIndustry.sw1.N,6656I means the group data is with dtype='int32'; Ashare.N,6656c means the univ data Ashare is with dtype='bool'; WindIndustry.wind1Ix.N64C means the groupIx data is with dtype='S64'. Writing and mostly, reading data consumes I/O resources and sometimes takes more time than training the model, we can parallely process data with concurrent.futures packages.
+
+1
+data = np.memmap("${cachepath}/${dataname}.N,6656f",mode='r',dtype=np.float32)
+Using numpy memmap requires us to know the data details very well, including the dateoffset, delay, and cube/matrix type, etc.
+
+1.1.2 Using NIO Wrapper to load data
+We also provide wrapped method to read and operate cached data as followings:
+
+When loading matrix data, we use an XML file to transfer the information required for data loading. The structure of the XML file is as bellow:
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+<Alpha mId="AlphaSimple" id="Feature1" uniqId="1" uId="AshareFiltered" delay="0" niopath="${cachepath}/${dataname}.N,6656f">
+    <AlphaInfo/>
+    <Op mId="OpWinsorize" std="4.0"/>
+    <Op mId="OpGroupNeutFast" group="market"/>
+</Alpha>
+ 
+<Alpha mId="AlphaSimple" id="Feature2" uniqId="2" ...>
+    ...
+</Alpha>
+Each parameter should be parsed in the python code of combo, then we could read the corresponding data from data cache according to the standard process:
+
+1
+2
+curnio = NIO_MATRIX_FIX_WINDOW(${data_niopath}, ${memdays}) ## memdays is used for saving memory
+data_di = curnio.get(di-${data_dateoffset})
+Now we can get the original value data_di of the data on day di. The above xml also shows that operators can operate on each loaded data <Op mId="OpWinsorize" std="4.0"/>. This part also needs to be implemented with python code:
+
+1
+2
+3
+for op in AlphaNode.getChildren("Op"):
+  opinstance = OperationsHandler.getInstance().Create(op.getAttribute('mId'), op)
+  opinstance.Apply(di, data_di)
+Therefore, we can get the value of a matrix data after operators on day di. If we need to get the results of more data on more days, we only need to use the for loop.
+
+Similarly, cube data could be loaded by the following way:
+
+1
+2
+3
+4
+curnio = NIO_CUBE()
+curnio.setDepth(54)
+curnio.LoadFromFile(niopath)
+cube_data_di = curnio.get(di-dateoffset)
+1.1.3 Using NioReader to load data
+Moreover, we can also use nioreader to read data from a specified path. This method is more suitable when loading custom data which dumped by ourselves.
+
+1
+2
+3
+4
+5
+6
+7
+import sys
+sys.path.append("/dat/pysimrelease/pysim-5.0.0/tools/")
+from NioReader import NioReader
+nioreader = NioReader()
+nioreader.loadData(${dataname}, ${data_niopath})
+data = nioreader[${dataname}]
+data_di = data[di % data.shape[0]]
+1.2 Data delay and dateoffset
+The data delay means the lag between the date index the data being used and date index pointing to the data's newest info. For instance, on the day with date index di, delay-0 data could use up to datadi, which means the data is updated on di and ready to be used; delay-1 data could only use up to datadi-1, which means the data's latest update is on di-1. In most cases data are either with delay=0 or delay=1.
+
+Different data have different dateoffset for saving storage space. All data_54 cubes have dataoffset 2048, all base features have dataoffset 1024, but note that base matrices have dataoffset 0. Old cubes, which have many different dataoffsets are deprecated and may no longer be used. Another trick is to observe the date dimension number, date dimension is 4096 means no dateoffset, 3072 means dateoffset=1024, 2048 means dateoffset=2048.
+
+We must set correct dateoffset when loading data from cache. The following table lists the correct dateoffset and delay corresponding to commonly used data:
+
+
+
+
+D1 alpha
+
+0
+
+1
+
+WAVE alpha
+
+1024
+
+0
+
+NEWI alpha
+
+2048
+
+0
+
+Raw Matrix Data
+
+0
+
+0/1
+
+Base Feature
+
+1024
+
+0/1
+
+CUBE Data
+
+2048
+
+0
+
+Note, when we read from our own dumped custom data, it is recommend to use rolling-dump in order to save disk space. At this time, there is no need to consider dateoffset while reading data with nioreader but to read data according to the index data[(di-data_delay) % data.shape0], and you must ensure that the data is used within the dump range.
+
+1.3 Cube and matrix
+As can be seen from the table above, most of the data is matrix data which is easily to process with the above data loading guidance. However, we need to consider the memory usage while loading the cube data. Loading too many cube data at once would make our combo too heavy to run. If we only need to obtain specific cross-section information in the cube data instead of using the information of all snaptime points, it can be considered to extract matrix information from the cube data through the HFExpr system and storing the matrix data as custom data, then we can simply load the custom matrix data.<br>Moreover, data are cached as memmap objects in contiguous memory, we can manually reshape them into the shape that can be understood better. For cubes, 359424f can be reshaped as (54, 6656). The first dimension might not be always 2048 or 4096, to avoid bugs, we can omit the first dimension by using (-1, 54, 6656) or (-1, 6656).
+
+2. Feature/Label Pre-processing
+2.1 Pre-processing features
+2.1.1 truncate extreme values
+It is more important for neural network models than boosting tree models to truncate extreme values. For instance, you may set values larger than 10 to 10, and values smaller than -10 to -10, you also may set values larger than 10xstd to 10xstd, and values smaller than -10xstd to -10xstd.
+
+2.1.2 handle NAN and inf values
+It is also more important for neural network models than boosting tree models to deal with Nan and inf values. There are several common ways: (信息). set Nan and inf values to 0; (ii). use certain group mean value; (iii). use the previous di date non-nan and non-inf value of this stock.
+
+Encountered problems: method (ii) and (iii) is relatively slow.
+
+2.1.3 deal with data of low ii/di coverage
+Recommend to set a threshold, and remove features whose coverage is lower than the threshold. However, for incrementally trained model, it is necessary to keep the shape of input feature the same at all time.
+
+2.1.4 ts-zscore and section-zscore
+There are several ways to preprocess input feature: (信息). zscore across all stocks sectionally; (ii). zscore across within group sectionally; (iii). ts-zscore (be careful about forward looking issues)
+
+Theoretically, there should be some features more suitable for tszscore, while others for section-zscore. You may try to apply different treatments to different features.
+
+2.2 Pre-processing labels
+2.2.1 calculate N-day-return correctly with adjfactor
+Normally we shall not calculate return manually to avoid potential mistakes, it is recommanded to directly refer to returns in following paths:
+
+/dat/cqcache/data_54/hhmmss/BaseMatrix/roll.returns_matrix.N,6656f
+/dat/cqcache/data_wave/hhmmss/roll.returnsX/roll.returnsX.N,6656f
+In the case of calculating returns manually, we need to adjust the current raw price by deviding cumadjfactor and the current volume by deviding the cumsplit. Here cumadjfactor/cumsplit is D0 available since we know the split/devidend event before SOD.
+
+2.2.2 group neutral and factor neutral
+Inner modules of Pysim, Oputil.neutralize removes the projection of an array against another. You may want to demean them before neutralize, otherwise the residual correlation might be still high. Or consider writing your own neutralize functions.
+
+It is worth trying to do group/factor neut on labels such as:
+
+group neut in sw1, GROUPHSZZ, CustomCorrgroup
+factor neut with PV terms: cap, tvr, close or Funda terms: pe, pb, etc<br>Basically the more items we choose to neut, the more risky returns we choose to give up. It may not be helpful to deliver higher RET but it can improve the SHARP in backtests. In a style-dominant period of market, the label-neut strategy may not be very competitive.
+2.2.3 truncate extreme values
+It is natural to truncate extreme values based on standard deviation, but the prior std might be affected by extreme values so you may want to do it several times. Percentile truncate do not have such issue but might lose more information.
+
+Moreover, it may also help to accelerate the convergence speed of training or improve backtest results if we remove out-lier samples.
+
+We can apply following techniques to truncate extreme values:
+
+log transformation on returns
+truncation based on 3 sigma rule
+drop directly
+From practice, label-engineering might have much more effect than feature-engineering.
+
+You may want to first truncate by absolute values (e.g. 10% if roll return), then do z-score truncate. Rank label might generate very different results as well.
+
+3. ML Model Training
+3.1 Reproductivity
+3.1.1 random seed setting
+Different random seed may lead to different results (longindex ret and ret after opt); A robust model is supposed to have relatively close performances between different random seeds.
+
+Suggest to set random seed by following code:
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+# pytorch
+def setup_seed(seed=42): 
+    os.environ['PYTHONHASHSEED'] = '0' 
+    np.random.seed(seed) 
+    random.seed(seed) 
+    torch.manual_seed(seed) 
+    torch.cuda.manual_seed_all(seed) 
+    torch.backends.cudnn.deterministic = True
+ 
+# tensorflow
+def setup_seed(seed=42): 
+    os.environ['PYTHONHASHSEED'] = '0' 
+    random.seed(seed ) 
+    np.random.seed(seed) 
+    tf.random.set_seed(seed ) 
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+It is recommended to use multiple seeds to train multiple models and take average as final output. And do not overfit for specific one random seed.
+
+3.1.2 randomness from model structure
+Such as dropout layer, bagging method, cutout, standout, drop connection and so on... Those model structure all have randomness when they are trained. We should control their random seed carefully.
+
+3.1.3 randomness from sampling
+Because we usually don't use full batch training method, (consider memory limit), we use mini-batch training method, so shuffle data and split into batch randomly could cause checkpoint issues. We should control dataset batch split randomness carefully, Usually, it is already guaranteed by 3.1.1. random seed setting .
+
+3.1.4 randomness from devices
+Same codes may run different outcomes in different devices. It is okay, but we need to guarantee the differences only come from this reason, it is better we do guarantee the re productivity in same devices first.
+
+3.2 Rolling train
+It's recommended that we train models periodically, to better catch up with the market change. We mainly use two methods to train.
+
+3.2.1 incremental train mode
+Every time we train a model, we do not reinitialize model weight after first time. We inherit model weight from last time we trained model. This mode is called incremental mode, this mode train shallow every time, and train incrementally on new data, not using old data very well. So the incremental train process generally is fast and costs less resources. The disadvantages are the model structure and the input feature number cannot be adjusted during the whole simulation history. And the backtest results depend on startdate as well.
+
+3.2.2 scratch train mode
+Every time we train a model, we do initialize model weight from scratch. Every time we train model individually. This mode is called scratch mode, this mode train deep every time, and train seperately on whole data. So the scratch train process is slow and costs more resources. The advantages are the model structure and the input feature number can be adjusted in process, we can easily remove features halfway and can do zero-out test (only use feature after the date when the feature is invented). Also in scratch training mode the model could be trained in parallel by spliting the simulation history into different parts.
+
+3.3 Filtering samples
+3.3.1 filtering samples via UpDown limit mask
+It can be tricky to decide whether we shall mask the stocks which hit up/down limit. It is recommanded to do AB test case by case depending on the model/feature we use.
+
+It is worth thinking following scenarios and try some delicate operations instead of universally mask/unmask:
+
+if we filtered up/down limit, how about stocks closed with 8%, 9.8% returns?
+if we not filtered up/down limit, what is the value of features we used on those up/down limit stocks, are they all NaNs?
+3.3.2 filtering samples via Universe
+Stocks can behave in very different ways among different universes. Including all available stocks in Ashare in training may lead to bad performance on HS300/ZZ500, since the number of stocks with tiny cap in the sample space has reached to a material level from year 2022.
+
+It is worth trying to select a specific universe different from Ashare as the training universe to improve the performance on HS300/ZZ500. It is recommanded to start testing with following universes:
+
+TOP3000CAP or TOPLIQ65
+It is also worth trying to build the training universe on your own. By carefully selecting stocks as training universe, we can achieve the effect of increasing noise2signal ratio in the first place.
+
+not all 微盘/北创50 stocks are devil, considering including some well-traded
+not all HS300/ZZ500 stocks are angel, considering removing ST/long-queue stocks
+3.4 Loss functions
+Loss functions is another important part in ML combos.
+
+3.4.1 regression loss
+In regression tasks, commonly used loss functions include Mean Squared Error (MSE), Mean Absolute Error (MAE), and Huber loss.
+
+MSE is the most frequently used loss function for profit prediction. It is sensitive to outliers because squaring the errors amplifies the impact of outliers in calculations.
+MAE is another regression loss function measuring the average absolute difference between actual and predicted values. It is more robust to outliers compared to MSE, as it uses absolute differences.
+Huber loss is a compromise between MSE and MAE, being more robust to outliers than MSE while approximating MSE near zero error and MAE at large errors. In practical use, MSE generally performs better.
+3.4.2 ranking loss
+Commonly used ranking loss functions include Pointwise loss functions, Pairwise loss functions, and Listwise loss functions.
+
+Pointwise loss functions transform ranking problems into regression problems, independently predicting and evaluating each sample. Regression loss functions (such as MSE, MAE) are commonly used to measure differences between actual and predicted values. Pointwise methods predict and calculate loss for each sample independently, providing high computational efficiency.
+Pairwise loss functions focus on the relative order between adjacent sample pairs, comparing the relative order of every two samples. A common pairwise loss is the RankNet loss.
+Listwise loss functions directly optimize the order of the entire ranking list instead of independently handling each sample or adjacent sample pairs. One common listwise loss is the ListNet loss. In practical use, pointwise is suitable for simple ranking tasks, pairwise focuses on relative order, and listwise, by globally optimizing the entire list's order, is suitable for more complex ranking problems.
+3.4.3 classification loss
+Common loss functions for classification tasks include Cross-Entropy Loss, Hinge Loss, and Focal Loss.
+
+Cross-Entropy Loss is a prevalent loss function for multi-class classification tasks, also known as log loss. It optimizes the model by minimizing the negative log probability of the actual class, sensitive to uncertainties.
+Hinge Loss is typically used in models like Support Vector Machines (SVM), penalizing the difference between the score for the correct class and the maximum score for incorrect classes.
+Focal Loss is designed to address class imbalance issues by reducing the weight of easily classifiable samples to focus on challenging samples.
+3.5 Avoid forward looking bias
+Forward looking bias occurs when "future" data are used in model training. For example, when the model is trained at date di, we use di+1's returns as label, or we use datadi in feature when the data is delay-1.
+
+Forward looking bias may make the backtest results NOT be able to realize in real trading. Especially when the results are particularly too good to be true, it is necessary to check if there exists forward looking. To avoid potential forward looking bias, we should first figure out the different 'delay' settings in ML combo.
+
+3.5.1 combo's delay
+We have delay-0 combos and delay-1 combos.
+
+Delay-0 combos run at specified snaptime lively to output latest prediction. In delay-0 combos on date di, we could use up to data_d1di-1 for delay-1 data_d1; and we could use up to data_d0di for delay-0 data_d0 if it's ready before the combo runs, otherwise we could only use up to data_d0di-1 even if it's delay-0 data.
+
+Delay-1 combos generally run before the market open and output the predictions for the whole day's trading. In delay-1 combos on date di, we could use up to data_d1di-1 for delay-1 data_d1 and data_d0di-1 for delay-0 data_d0 as well, since the combo runs before the market open and we don't have delay-0 data ready yet.
+
+3.5.2 ML model's trainDelay
+ML model's trainDelay is defined as the lag between the date we train the ML model and the newest date of data we used in train. If we train the model on date di, and use data up to di, then the trainDelay=0; if we train the model on date di, but use data up to di-1, then the trainDelay=1.
+
+Generally, due to the training cost of ML models, it is impossible we use most recent data to train during market trading period. So for most cases, we use trainDelay=1 for ML combos.
+
+Combine combo's delay and ML model's trainDelay, we have:
+
+delay-0 ML combo with trainDelay=1(most cases) : train before the market open and predict lively during market trading period. For delay-0 matrix data ready before predict, we could use data up to di-1 in train process, and up to di in predict process; For delay-0 matrix data NOT ready before predict and delay-1 data, we could use data up to di-1 in train process, and up to di-1 in predict process; For CUBE data, we could use data up to di-1 for train process and (di, ti) for predict process.
+delay-0 ML combo with trainDelay=0(rare cases): train and predict lively at the specified snaptime. For delay-0 data ready before train and predict, we could use data up to di in training process, and up to di in predict process; For delay-0 data NOT ready before predict and delay-1 data, we could use data upto di-1 in train process, and upto di-1 in predict process; For CUBE data, we could use data upto (di, ti) for both train and predict process.
+delay-1 ML combo: train and predict before market open. For delay-1 matrix data, delay-0 matrix data and CUBE data, we could use data up to di-1 in training process, and up to di-1 in predict process. In delay-1 ML combo, trainDelay is not necessary to set.
+3.5.3 different types of forward looking
+Data leakage, also known as forward looking bias, whether in the process of crafting factors or creating models, is a common and highly covert problem. It can be challenging to detect at times, leading to discrepancies between live trading performance and backtesting results. Common sources of data leakage may stem from the following factors:
+
+Inherent data issues: During the model development process, exceptional performance observed in certain data, such as an individual data point's long/index performance surpassing or closely resembling the overall model performance, may indicate the use of future information.
+Cutoff date for training data: Generally, models used for predicting the next "di" days incorporate data up to "di" days before for training. In terms of features, attention should be paid to delay and dateoffset. Regarding y label, the data "roll.returnsdi" is generated on the day "di" corresponding to snaptime. Therefore, training after the closing of day "di-1" cannot obtain "roll.returnsdi," at most using "roll.returnsdi-1." Consequently, features can only incorporate information up to day "di-2." In general, as the frequency shortens, the duration of training data decreases, and the impact of errors caused by incorrect training cutoff dates becomes more significant.
+Use of future information for data selection: For instance, employing dynamic data selection methods for model creation may involve training the model on day "di" while using data information from after day "di" for selection, leading to seemingly satisfactory model backtesting results.
+NaN filling methods: Various methods exist for NaN filling, including filling with zeros, medians, modes, or reverse model predictions. For example, when filling with the median, using the median of the day's data during preprocessing avoids data leakage issues. However, if a period is used to obtain the median, attention must be paid to the interval of that period.
+Involvement of temporal data pre-processing: For instance, if "tszscore" uses data from a future period for standardization, it significantly enhances model performance.
+Other factors, such as universe selection and barra data, leading to data leakage.
+3.6 train/validation setting
+There are several considerations for setting up training and validation sets:
+
+Time series partitioning: Dividing the data into training and validation sets based on chronological order.
+Random shuffling before data partitioning: For example, shuffling the data and using 20% or 10% for validation.
+Stratified sampling: If employing a classification model, such as predicting market rises and falls, where class imbalances may exist, stratified sampling can be used to maintain consistent proportions of each category in the training and validation sets.
+k-fold cross-validation: Dividing the data into multiple subsets, performing training and validation multiple times, and comprehensively assessing model performance to reduce differences caused by different dataset splits.
+4. Live Trading Requirements
+Before submission, the combo code should support both Hist Mode and Live Mode with checkpoint. In Hist Mode, we continuously to train a model and get in-sample performance without checkpoint. In Live Mode, after Hist training, we need save the model and all the data needed into checkpoint files, and in the next day before market open, we load the saved model and data from checkpoint files, then we use them to train a new model for that day's prediction. For most cases, ML models only run predict process in Live Mode.
+
+4.1 Consistency of performance
+We should ensure the outputs of model are the same between with/without checkpoint. If they are not the same, you can check the following points:
+
+Input data and data pre-processing
+Hyper parameters
+random seed setting.
+You can refer to: http://172.18.1.53:19080/display/AW/Checkpoint+Issues.
+
+We should also make sure the output of hist mode and live mode are the same.
+
+4.2 Speed of inference
+We should ensure live mode of our model is fast enough(less than 10 sec for E2E model). In live mode, time is consumed in 3 period: loading data, data pre-processing and model prediction. We can save time using the following methods.
+
+4.2.1 data pre-load
+We usually set checkpointDays=2, so in live mode, we need run di-1 and di after checkpoint load. In fact, both di-1 and di will be ran in day=di , and day=di is running lively. So we can preload di-1 D1 data or even ti-3 data in di (maybe ti-1 is so close and not available, usually ti-3 is available) when running day=di-1. Make sure when ti is coming, we need load least data. For more info you can refer:
+
+http://172.18.1.53:19080/display/AW/Preload+D1+alphas+to+reduce+time+cost+of+livetrading
+
+4.2.2 Data pre-processing
+Using parallelized method for data processing and avoid repeated calculations, incrementally calculation techniques might be usefull for some statistics value.
+
+4.2.3 Model predict
+Using GPU instead of CPU can save a lot of time for inference of complicated model such as RNN, Tranformer... In Tensorflow, the default parameter of model.predict() function is batchsize=32, using larger batchsize can also make inference faster. In TensorFlow, model(x_predict) and model.predict(x_predict) can both be used in inference, and usually, model(x_predict) is faster than model.predict(x_predict).
+
+You can use method in http://172.18.1.53:19080/display/AW/Test+before+submission to test speed of inference.
+
+4.3 Checkpoint usage
+4.3.1. checkpoint file size
+Checkpoint file on disk should not be too large (>1G), unless your model is very deep and large. If the size is too large, it's suggested to reload raw cache data when load checkpoint.
+
+4.3.2. consistency 
+Checkpoint is like saving game halfway. Next you start a game from checkpoint, you should make sure the checkpoint function is just like you play it seems you played last time you dont quit the game. For instance, we do such test to guarantee the checkpoint consistency:<br>i. without any checkpoint, we run simulations and get pnl result A of date 20240110<br>ii. with checkpoint saved on date 20240108 (it could be any date before 20240110), we quit the simulation. and start again from 20240108 with loading checkpoint, and get pnl result B of date 20240110.<br>iii. A and B should be exactly the same. 99.99% similarity is also not acceptable except you have your special and rational explanation.
+
+4.4 Train frequency
+4.4.1. daily train
+train freq == 1
+
+It is ordinary and unremarkable, the model is updated every day once there are new data generated. It may capture market rapid change, but is also easily affected by noise.
+
+4.4.2. weekly train / monthly train
+train freq > 1
+
+If you set train freq == 5, replace it with training at the weekend might be more realistic. A simple way is: after prediction, if next calendar day is not trade date, then train. However in production uv.Dates can not find future trading date, so you may try WindTradingdate as below:
+
+1
+2
+3
+today = datetime.datetime.strptime(str(self.WindTradingdate[di]), "%Y%m%d")
+next_trading_day = datetime.datetime.strptime(str(self.WindTradingdate[di+1]), "%Y%m%d")
+diff = (next_trading_day - today).days
+4.5 Code to support different live trading scenarios
+During live trading period, we mostly only run the model prediction but NOT train the ML model due to real-time time limit. To support this, our ML combo code need to:
+
+4.5.1 Support HIST mode and LIVE mode
+HIST mode: run model training and predictions normally during research period and in production to update ML model periodically.
+LIVE mode: only runs during live trading period, and run prediction with newest feature input.
+Generally in production environment, we will first run the HIST mode to get the historical performance of the ML model, dump alpha files, save model parameters to disk and save variables to checkpoint. Then we will run LIVE mode and HIST mode in turn. In LIVE mode we output latest predictions in live trading and update(train) model before market open or after market close.
+
+4.5.2 Support model training in 2 cases: before market open; after market close
+In production, the ML model may run the HIST mode before market open or after market close, which depends on:
+
+The resource usage(mainly CPU/GPU) of production machine
+The running speed and resource usage of the ML model
+So we need the ML combo to support model training before market open and model training after market close. Here's the difference of these two situation:
+
+trainDelay=1, train before market open, which means we can only use data up to di-1.
+trainDelay=0, train after market close OR at weekends, which means we could use data upto di, but the prediction can only use model up to di-1.
+The code need to make sure the combo performance are exactly same in different situations:
+
+Run the code twice with HIST mode and checkpoint setting, the performance is same;
+Run the code twice with HIST mode and LIVE mode after checkpoint load, the performance is same;
+Either with trainDelay=0 or trainDelay=1, 1&2 are with same performance.
+4.5.3 Sample code
+Here's a sample code to support above requirements; we use model/model_di/oldmodel/oldmodel_di to support different situations. Researchers have their own implementations.
+
+ 展开源码
+Note,
+
+Here we save the model with date on di - self.trainDelay. If trainDelay=1, which means we run HIST mode before market open and before LIVE mode, we could use the latest model for prediction. If trainDelay=0, which means we run HIST mode after market close or at weekends and after LIVE mode, we cannot use the latest model for prediction when model_di == di, which means the model trained on di cannot be used for prediction on di.
+In sample code we only use 1 latest model for prediction, and 2 models(self.model and self.oldmodel) to store. If we use recent N models in prediction (e.g., models on di-freq, di-freq_2_,* di-freq*3), then we shall store N+1 models.
+5. Resource Usage
+Combo research is a resource intensive work. Bad coding/wrong settings/unintentioned bugs would lead to extremly resource wasting. We need to monitor all the resource usage(CPU/GPU/memory/disk/etc.) carefully. Here're some tips.
+
+5.1 CPU/GPU/memory usage
+Set proper number of threads for packages like tensorflow/lightgbm/pytorch/sklearn/etc.
+
+1
+2
+3
+4
+5
+6
+## for pytorch
+import torch
+torch.set_num_threads(num_threads)
+## for tensorflow
+import tensorflow as tf
+tf.config.threading.set_intra_op_parallelism_threads(num_threads) tf.config.threading.set_inter_op_parallelism_threads(num_threads)
+Monitor GPU usage via small tools like nvidia-smi or gpustat.
+
+5.1.1 Tips for saving memory
+Memory usage could be a problem if reading a large amount of data into memory. One trick is that float32 could be unnecessary. One can use float16 instead without losing much precision. To be noticed, float16 range is -65504,+65504, the value should be in the range before converted from float32 to float16. Usually, we can safely do things like:
+
+1
+returns_loaded = np.float16(returns_loaded)
+to save memory. However, it is always recommended to check value range of data before this operation.
+
+5.2 Time/Resource trade-off
+A baseline model that runs fast & consumes small resources to get hands on is recommended. Further, you may want to increase the complexity of your model at the cost of longer time or/and more resource consumption. Typically a server may have 6-8 GPU and 1-2 T memory, allocate them and consider trade-off wisely.
+
+There are a lot of public GPU servers shared across researchers. However GPUs are more likely to have incur issues than CPUs; also losing/terminating ML combo tasks are more "expensive" for researchers since it is harder to recover/takes more time to run for ML combo research compared with alpha research. So there are some Public GPU usage manners that are recommended:
+
+a. Go for GPUs that do not have current tasks on, instead of GPUs that are being used for other colleagues. Even if existing tasks looks light, it may increase consumption dynamically over time. If there are no empty GPUs, discussion with current task owner is recommended.
+
+b. Parallel / grid search is OK and you may parallel your tasks on an empty GPU. Parallel too much might takes too much I/O resource as well; even if the tasks are light, around 10 tasks per server is generally safe for other tasks by practice
+
+c. Occupy too much memory on a server may slows down other tasks or incur OOM.
+
+6. Performance Evaluation
+6.1 Raw combo performance
+Generally, we need to check the raw ML Combo's performance first before processing other tests. We use below CalcModules to get different types of raw performance for ML Combos:
+
+1
+2
+3
+4
+5
+<CalcModuleExt id="CalcSimpleIndex" path="${PYEXTPATH}/modules/libcalcsimple3.so"/>
+## Calculate long/short performance
+<Calc mId="CalcSimpleIndex" pnlDir="${PRODUCTIONPATH}/pnl.longshort" sellPrice="Snapstats.vwap" buyPrice="Snapstats.vwap"/>
+## Calculate long/index performance
+<Calc mId="CalcSimpleIndex" pnlDir="${PRODUCTIONPATH}/pnl.index" hedge="Indices_399905.close" hedgeratio1="1" sellPrice="Snapstats.vwap" buyPrice="Snapstats.vwap"/>
+Long/short: the vanilla long short return of your combo.
+Long/index: long of the long side of your combo, short index(zz500 here, using Indices_399905) instead of the short side of your combo. This is the more "realistic" results, since we can not short individual stocks but only indices futures on the futures market.
+6.2 Combo Performance after TradeOpt
+The combo performance is more realistic and close to real trading after using op TradeOpt with below CalcModule:
+
+1
+2
+## Calculate long/index performance with trading cost
+<Calc mId="CalcSimpleIndex" pnlDir="${PRODUCTIONPATH}/pnl.index.slippage" hedge="Indices_399905.close" hedgeratio1="1" sellPrice="Snapstats.vwap" buyPrice="Snapstats.vwap" slippage="spreadslippagenew" booksize="4e7"/>
+TradeOpt is essentially a trade module to optimize and improve the raw combo prediction. It makes your strategy satisfy turnover/risk exposure/trade volume requirements and also to retain the performance as much as possible. Check wiki page for more information: http://172.18.1.53:19080/display/AW/TradeOpt
+
+The after opt performance thresholds for IS is improved gradually. Currently(with enddate=20230630), if you have return after opt of average 15%+ in 2023, it's worth continuing the research direction; Historical return in 2020-2022 should be higher.
+
+6.3 Value adding
+We care about value adding after opt in combo research. Similar to alpha, the combo's value comes from 1) good performance or/and 2) low similarity/corr with existing strategies. At combo level, long/index corr < 0.85 are considered to be quite different.
+
+6.4 Performance robustness
+6.4.1 Performance continuity
+A good combo result should be continuously distributed on the hyper-parameter space. If a result seems to be good, such as return after opt is high~20%, but you just change the hyper-parameter a little, the result decrease very fast and randomly, we can't say it's a stable good result.
+
+A good combo result should be insensitive to random seeds an NOT be heavily influenced by different random seeds. 0.5~1% is acceptable.
+
+6.4.2 IS/OS tradeoff
+The better we fit in-sample, perhaps the worse the out-of-sample performance will be when a threshold is exceeded, so we should weight the degree of fit within the sample. One practical method is to use semi-OS to evaluate the strategy. But if we test too many times on semi-OS, similar issues might occur. One possible suggestion is to observe data more deeply, artificially elaborate model more precisely and more rational, and not be over-reliance on large and deep models.
+
+6.4.3 Startdate robustness
+Combo performance should be robust against different startdate. We could test this by setting different startdate in config. However TradeOpt might accumulates minor differences, try checking long index performance/turnover/position correlation without TradeOpt.
